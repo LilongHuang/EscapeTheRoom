@@ -1,0 +1,1194 @@
+<html>
+<head>
+<title>Escape the room!</title>
+<meta http-equiv="content-type" content="text/html; charset=ISO-8859-1">
+<!--
+    Lilong Huang
+    Josh Lee
+    Jacob Foster
+    CSC 525 FA 2012
+    Final Project
+--!>
+
+<script type="text/javascript" src="js/jquery.js"></script>
+<script type="text/javascript" src="js/webgl-obj-loader.js"></script>
+<script type="text/javascript" src="js/glMatrix-0.9.5.min.js"></script>
+<script type="text/javascript" src="js/webgl-utils.js"></script>
+
+<script id="phong-lighting-fs" type="x-shader/x-fragment">
+    precision mediump float;
+
+    varying vec2 vTextureCoord;
+    varying vec3 vTransformedNormal;
+    varying vec4 vPosition;
+
+    uniform float uMaterialShininess;
+    uniform float uFogIntensity;
+
+    uniform vec3 uAmbientColor;
+
+    uniform vec3 uPointLightingLocation;
+    uniform vec3 uPointLightingSpecularColor;
+    uniform vec3 uPointLightingDiffuseColor;
+
+    uniform sampler2D uSampler;
+
+    uniform bool uPickingRender;
+    uniform vec4 uObjectColor;
+
+    void main(void) {
+        if (uPickingRender) {
+            gl_FragColor = uObjectColor;
+            return;
+        }
+        else {
+            vec3 lightWeighting;
+
+            vec3 lightDirection = normalize(uPointLightingLocation - vPosition.xyz);
+            vec3 normal = normalize(vTransformedNormal);
+
+            float specularLightWeighting = 0.0;
+            vec3 eyeDirection = normalize(-vPosition.xyz);
+            vec3 reflectionDirection = reflect(-lightDirection, normal);
+
+            specularLightWeighting = pow(max(dot(reflectionDirection, eyeDirection), 0.0), uMaterialShininess);
+
+            float diffuseLightWeighting = max(dot(normal, lightDirection), 0.0);
+
+            vec4 fog_color = vec4(0.01, 0.05, 0.01, 0.5);
+
+            float fog = exp(-abs(vPosition.z)*uFogIntensity);
+            fog = clamp(fog, 0.0, 1.0);
+
+            lightWeighting = uAmbientColor + uPointLightingSpecularColor * specularLightWeighting + uPointLightingDiffuseColor * diffuseLightWeighting;
+
+            vec4 fragmentColor = texture2D(uSampler, vec2(vTextureCoord.s, vTextureCoord.t));
+
+            gl_FragColor = mix(fog_color, vec4(fragmentColor.rgb * lightWeighting, fragmentColor.a), fog);
+        }
+    }
+</script>
+
+<script id="phong-lighting-vs" type="x-shader/x-vertex">
+    attribute vec3 aVertexPosition;
+    attribute vec3 aVertexNormal;
+    attribute vec2 aTextureCoord;
+
+    uniform mat4 uMVMatrix;
+    uniform mat4 uPMatrix;
+    uniform mat3 uNMatrix;
+
+    varying vec2 vTextureCoord;
+    varying vec3 vTransformedNormal;
+    varying vec4 vPosition;
+
+
+    void main(void) {
+        vPosition = uMVMatrix * vec4(aVertexPosition, 1.0);
+        gl_Position = uPMatrix * vPosition;
+        vTextureCoord = aTextureCoord;
+        vTransformedNormal = uNMatrix * aVertexNormal;
+    }
+</script>
+
+<script id="particle-vs" type="x-shader/x-vertex">
+    attribute vec4 aParticleLocation;
+
+    uniform mat4 uMVMatrix;
+    uniform mat4 uPMatrix;
+    uniform float uPointSize;
+
+    varying vec4 vPosition;
+    varying float vLifespan;
+
+    void main(void) {
+        vPosition = uMVMatrix * vec4(aParticleLocation.xyz, 1.0);
+        gl_Position = uPMatrix * vPosition;
+        vLifespan = aParticleLocation.w;
+        gl_PointSize = uPointSize * vLifespan;
+    }
+</script>
+
+<script id="particle-fs" type="x-shader/x-fragment">
+    precision highp float;
+
+    uniform vec3 uColor;
+    uniform float uFogIntensity;
+
+    varying float vLifespan;
+    varying vec4 vPosition;
+
+    void main(void) {
+        vec4 fog_color = vec4(0.01, 0.05, 0.01, 0.5);
+
+        float fog = exp(-abs(vPosition.z)*uFogIntensity);
+        fog = clamp(fog, 0.0, 1.0);
+
+        gl_FragColor = mix(fog_color, vec4(uColor.rgb, 1.0 * vLifespan), fog);
+    }
+</script>
+
+<script type="text/javascript">
+
+    var gl;
+    var myTextures = {};
+    var myObjects = {};
+    var myPickerHash = {};
+    var myMeshes = {};
+    var offScreen = {};
+    var shaderPrograms = {};
+    var particleData = {};
+    particleData.particles = [];
+    particleData.particleSize = 3.0;
+    particleData.originX = -9.3;
+    particleData.originY = 0.0;
+    particleData.originZ = 8.8;
+    particleData.color = [0.05, 0.2, 0.05];
+    particleData.particleLifespan = 6.0;
+
+
+    function initGL(canvas) {
+        try {
+            gl = canvas.getContext("experimental-webgl");
+            gl.viewportWidth = canvas.width;
+            gl.viewportHeight = canvas.height;
+        } catch (e) {
+        }
+        if (!gl) {
+            alert("Could not initialise WebGL, sorry :-(");
+        }
+    }
+
+
+    function getShader(gl, id) {
+        var shaderScript = document.getElementById(id);
+        if (!shaderScript) {
+            return null;
+        }
+
+        var str = "";
+        var k = shaderScript.firstChild;
+        while (k) {
+            if (k.nodeType == 3) {
+                str += k.textContent;
+            }
+            k = k.nextSibling;
+        }
+
+        var shader;
+        if (shaderScript.type == "x-shader/x-fragment") {
+            shader = gl.createShader(gl.FRAGMENT_SHADER);
+        } else if (shaderScript.type == "x-shader/x-vertex") {
+            shader = gl.createShader(gl.VERTEX_SHADER);
+        } else {
+            return null;
+        }
+
+        gl.shaderSource(shader, str);
+        gl.compileShader(shader);
+
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            alert(gl.getShaderInfoLog(shader));
+            return null;
+        }
+
+        return shader;
+    }
+
+    function createLightingProgram(fragmentShaderID, vertexShaderID) {
+        var fragmentShader = getShader(gl, fragmentShaderID);
+        var vertexShader = getShader(gl, vertexShaderID);
+
+        var program = gl.createProgram();
+        gl.attachShader(program, vertexShader);
+        gl.attachShader(program, fragmentShader);
+        gl.linkProgram(program);
+
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+            alert("Could not initialise shaders");
+        }
+
+        program.vertexPositionAttribute = gl.getAttribLocation(program, "aVertexPosition");
+        gl.enableVertexAttribArray(program.vertexPositionAttribute);
+
+        program.vertexNormalAttribute = gl.getAttribLocation(program, "aVertexNormal");
+        gl.enableVertexAttribArray(program.vertexNormalAttribute);
+
+        program.textureCoordAttribute = gl.getAttribLocation(program, "aTextureCoord");
+        gl.enableVertexAttribArray(program.textureCoordAttribute);
+
+        program.pMatrixUniform = gl.getUniformLocation(program, "uPMatrix");
+        program.mvMatrixUniform = gl.getUniformLocation(program, "uMVMatrix");
+        program.nMatrixUniform = gl.getUniformLocation(program, "uNMatrix");
+        program.samplerUniform = gl.getUniformLocation(program, "uSampler");
+        program.materialShininessUniform = gl.getUniformLocation(program, "uMaterialShininess");
+        program.fogIntensityUniform = gl.getUniformLocation(program, "uFogIntensity");
+        program.ambientColorUniform = gl.getUniformLocation(program, "uAmbientColor");
+        program.pointLightingLocationUniform = gl.getUniformLocation(program, "uPointLightingLocation");
+        program.pointLightingSpecularColorUniform = gl.getUniformLocation(program, "uPointLightingSpecularColor");
+        program.pointLightingDiffuseColorUniform = gl.getUniformLocation(program, "uPointLightingDiffuseColor");
+        program.pickerRenderUniform = gl.getUniformLocation(program, "uPickingRender");
+        program.objectColorUniform = gl.getUniformLocation(program, "uObjectColor");
+
+        return program;
+    }
+
+    function createParticleProgram(fragmentShaderID, vertexShaderID) {
+        var fragmentShader = getShader(gl, fragmentShaderID);
+        var vertexShader = getShader(gl, vertexShaderID);
+
+        var program = gl.createProgram();
+        gl.attachShader(program, vertexShader);
+        gl.attachShader(program, fragmentShader);
+        gl.linkProgram(program);
+
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+            alert("Could not initialise shaders");
+        }
+
+        program.particleLocationAttribute = gl.getAttribLocation(program, "aParticleLocation");
+        gl.enableVertexAttribArray(program.particleLocationAttribute);
+
+        program.pMatrixUniform = gl.getUniformLocation(program, "uPMatrix");
+        program.mvMatrixUniform = gl.getUniformLocation(program, "uMVMatrix");
+
+        program.colorUniform = gl.getUniformLocation(program, "uColor");
+        program.pointSizeUniform = gl.getUniformLocation(program, "uPointSize");
+        program.fogIntensityUniform = gl.getUniformLocation(program, "uFogIntensity");
+
+        return program;
+    }
+
+    function initShaders() {
+        shaderPrograms.phongLighting = createLightingProgram("phong-lighting-fs", "phong-lighting-vs");
+        shaderPrograms.particles = createParticleProgram("particle-fs", "particle-vs");
+    }
+
+
+    function handleLoadedTexture(texture) {
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, texture.image);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.MIRRORED_REPEAT);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.MIRRORED_REPEAT);
+        gl.generateMipmap(gl.TEXTURE_2D);
+
+        gl.bindTexture(gl.TEXTURE_2D, null);
+    }
+
+    function initTexture(textureName, extension) {
+        myTextures[textureName] = gl.createTexture();
+        myTextures[textureName].image = new Image();
+        myTextures[textureName].image.onload = function () {
+            handleLoadedTexture(myTextures[textureName]);
+        }
+        myTextures[textureName].image.src = "images/" + textureName + extension;
+    }
+
+    function initTextures() {
+        var textureList = { 'bed': '.jpg', 'desk_wood': '.jpg', 'table_wood': '.jpg',
+                            'floor': '.jpg', 'wall': '.jpg', 'ceiling': '.gif',
+                            'frame': '.jpeg', 'shade': '.jpg', 'door': '.jpg',
+                            'metal': '.jpg', 'cloth': '.jpg', 'vent': '.jpg',
+                            'door_frame': '.jpg', 'tendollar': '.jpg',
+                            'bluemetal': '.jpg', 'cup': '.jpg', 'chest': '.jpg', 'plane': '.jpg', 'sofa': '.jpg', 'ctable': '.jpg',
+                            'rug': '.jpg', 'tvStand': '.jpg', 'computer2': '.jpg'};
+
+
+        $.each(textureList, function(name, ext) {
+            initTexture(name, ext);
+        });
+    }
+
+    var mvMatrix = mat4.create();
+    var mvMatrixStack = [];
+    var pMatrix = mat4.create();
+
+    function mvPushMatrix() {
+        var copy = mat4.create();
+        mat4.set(mvMatrix, copy);
+        mvMatrixStack.push(copy);
+    }
+
+    function mvPopMatrix() {
+        if (mvMatrixStack.length == 0) {
+            throw "Invalid popMatrix!";
+        }
+        mvMatrix = mvMatrixStack.pop();
+    }
+
+    function setMatrixUniforms(program) {
+        gl.uniformMatrix4fv(program.pMatrixUniform, false, pMatrix);
+        gl.uniformMatrix4fv(program.mvMatrixUniform, false, mvMatrix);
+
+        if (program != shaderPrograms.particles) {
+            var normalMatrix = mat3.create();
+            mat4.toInverseMat3(mvMatrix, normalMatrix);
+            mat3.transpose(normalMatrix);
+            gl.uniformMatrix3fv(shaderPrograms.phongLighting.nMatrixUniform, false, normalMatrix);
+        }
+    }
+
+    function setupArrayBuffer(bufferInstance, vertices, itemSize, numItems) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, bufferInstance);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STATIC_DRAW);
+        bufferInstance.itemSize = itemSize;
+        bufferInstance.numItems = numItems;
+    }
+
+    function setupElementArrayBuffer(bufferInstance, vertices, itemSize, numItems) {
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bufferInstance);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(vertices), gl.STATIC_DRAW);
+        bufferInstance.itemSize = itemSize;
+        bufferInstance.numItems = numItems;
+    }
+
+    function sceneObject(pickerColor) {
+        this.pickerColor = pickerColor;
+        this.scaling = [1.0, 1.0, 1.0];
+        this.translation = [0.0, 0.0, 0.0];
+        this.rotateX = null;
+        this.rotateY = null;
+        this.rotateZ = null;
+        this.texture = null;
+        this.visible = true;
+        this.preTranslate = null;
+        this.postRotate = null;
+        this.doAnimation = false;
+        this.shininess = null;
+    }
+
+    function initObjects() {
+
+        // Use a single square template as the base for all walls
+        // Making a deep copy so you can modify the texture wrapping aspect
+        myMeshes.ceiling = jQuery.extend(true, {}, myMeshes.square);
+        myMeshes.ceiling.textures = [  0.0, 0.0,
+                                        0.0, 10.0,
+                                        10.0, 0.0,
+                                        10.0, 10.0 ];
+        myMeshes.floor = myMeshes.ceiling;
+
+        myMeshes.leftWall = jQuery.extend(true, {}, myMeshes.square);
+        myMeshes.leftWall.textures = [  0.0, 0.0,
+                                        0.0, 2.0,
+                                        2.0, 0.0,
+                                        2.0, 2.0 ];
+        myMeshes.rightWall = myMeshes.leftWall;
+        myMeshes.frontWall = myMeshes.leftWall;
+        myMeshes.backWall = myMeshes.leftWall;
+
+        myMeshes.door_frame = myMeshes.square;
+        myMeshes.rug = myMeshes.ceiling;
+
+        myMeshes.shade_pic = jQuery.extend(true, {}, myMeshes.square);
+        myMeshes.vent = myMeshes.shade_pic;
+
+        // Use the drawer template (Open top cube with thick edges)
+        // to make things
+        myMeshes.frame = jQuery.extend(true, {}, myMeshes.drawer);
+
+        // Use the cube template to make things
+        myMeshes.door = jQuery.extend(true, {}, myMeshes.cube);
+
+        //keep unnecessary objects from hashing into the picking hash array
+        myMeshes.ceiling.doNotHash = true;
+        myMeshes.leftWall.doNotHash = true;
+        myMeshes.square.doNotHash = true;
+        myMeshes.cube.doNotHash = true;
+        myMeshes.drawer.doNotHash = true;
+        myMeshes.toyplane.doNotHash = true;
+        myMeshes.sofa.doNotHash = true;
+        myMeshes.coffeeTable.doNotHash = true;
+        myMeshes.rug.doNotHash = true;
+        myMeshes.tvStand.doNotHash = true;
+        myMeshes.tv.doNotHash = true;
+
+        var delta = 0.1;
+
+        var hashColor = [delta, delta, delta];
+        var currentIndex = 0;
+
+        // Init the buffers for all of the meshes
+        $.each( myMeshes, function(key, mesh) {
+            if(mesh.doNotHash === undefined) {
+                myObjects[key] = new sceneObject([hashColor[0], hashColor[1], hashColor[2]]);
+                myPickerHash[String(Math.floor(hashColor[0] * 255)) + String(Math.floor(hashColor[1] * 255)) + String(Math.floor(hashColor[2] * 255))] = key;
+                hashColor[currentIndex % 3] += delta;
+                if(hashColor[currentIndex % 3] > 0.5)
+                    alert('Ran out of room to hash objects for the picker');
+                currentIndex++;
+            }
+            else {
+                myObjects[key] = new sceneObject([1.0, 1.0, 1.0]);
+            }
+
+            myObjects[key].VertexPositionBuffer = gl.createBuffer();
+            setupArrayBuffer(myObjects[key].VertexPositionBuffer, mesh.vertices, 3, mesh.vertices.length/3);
+
+            myObjects[key].TextureCoordBuffer = gl.createBuffer();
+            setupArrayBuffer(myObjects[key].TextureCoordBuffer, mesh.textures, 2, mesh.textures.length/2);
+
+            myObjects[key].VertexNormalBuffer = gl.createBuffer();
+            setupArrayBuffer(myObjects[key].VertexNormalBuffer, mesh.vertexNormals, 3, mesh.vertexNormals.length/3);
+
+            myObjects[key].VertexIndexBuffer = gl.createBuffer();
+            setupElementArrayBuffer(myObjects[key].VertexIndexBuffer, mesh.indices, 1, mesh.indices.length);
+
+        });
+
+        myObjects.table.scaling = [0.1, 0.1, 0.1];
+        myObjects.table.translation = [-8.0, 0.0, -7.0];
+        myObjects.table.texture = myTextures.table_wood;
+        myObjects.table.shininess = 50;
+
+        myObjects.bed.scaling = [0.01, 0.01, 0.01];
+        myObjects.bed.translation = [6.0, 2.5, -8.0];
+        myObjects.bed.rotateY = Math.PI;
+        myObjects.bed.texture = myTextures.bed;
+
+        myObjects.frame.scaling = [0.5, 0.1, 1.0];
+        myObjects.frame.translation = [9.9, 5.0, 0.0];
+        myObjects.frame.rotateX = Math.PI/2;
+        myObjects.frame.rotateY = -Math.PI/2;
+        myObjects.frame.texture = myTextures.frame;
+        myObjects.frame.animationDirection = 1;      //lilong mod
+        myObjects.frame.animate = function () {
+            if (this.translation[2] < 0.0) {
+                this.doAnimation = false;
+                this.animationDirection *=-1;
+                this.translation[2] = 0.0;
+            } else if (this.translation[2] > 1.0) {
+                this.doAnimation = false;
+                this.animationDirection *=-1;
+                this.translation[2] = 1.0;
+            } else {
+                this.translation[2] += 0.01 * this.animationDirection;
+            }
+        }
+
+        myObjects.key.scaling = [0.075, 0.075, 0.075];
+        myObjects.key.translation = [9.0, 2.0, -8.0];
+        myObjects.key.rotateX = Math.PI/2;
+        myObjects.key.texture = myTextures.metal;
+
+        myObjects.tendollar.scaling = [0.1, 0.1, 0.1];
+        myObjects.tendollar.translation = [10.0, 5.0, 0.0];
+        myObjects.tendollar.rotateZ = Math.PI/2;
+        myObjects.tendollar.rotateX = Math.PI/2;
+        myObjects.tendollar.rotateY = -Math.PI/2;
+        myObjects.tendollar.texture = myTextures.tendollar;
+
+        myObjects.bluekey.scaling = [0.025, 0.025, 0.025];
+        myObjects.bluekey.translation = [9.89, 4.7, 0.0];
+        myObjects.bluekey.rotateZ = Math.PI/2;
+        myObjects.bluekey.rotateX = Math.PI/2;
+        myObjects.bluekey.texture = myTextures.bluemetal;
+        myObjects.bluekey.animationDirection = 1;
+        myObjects.bluekey.animate = function () {
+            if (this.translation[2] < 0.0) {
+                this.doAnimation = false;
+                this.animationDirection *=-1;
+                this.translation[2] = 0.0;
+            } else if (this.translation[2] > 1.0) {
+                this.doAnimation = false;
+                this.animationDirection *=-1;
+                this.translation[2] = 1.0;
+            } else {
+                this.translation[2] += 0.01 * this.animationDirection;
+            }
+        }
+
+        myObjects.toyplane.scaling = [0.025, 0.025, 0.025];
+        myObjects.toyplane.translation = [-8.0, 3.15 ,-9.0];
+        myObjects.toyplane.rotateY = -20;
+        myObjects.toyplane.texture = myTextures.plane;
+        
+        myObjects.sofa.translation = [7.6, 0.0 ,1.0];
+        myObjects.sofa.scaling = [0.5, 0.5, 0.5];
+        myObjects.sofa.rotateY = -1.55;
+        myObjects.sofa.texture = myTextures.sofa;
+        
+        myObjects.rug.translation = [0.0, 0.20 ,1.0];
+        myObjects.rug.scaling = [6.0, 0.10, 6.0];
+        myObjects.rug.texture = myTextures.rug;
+        
+        myObjects.coffeeTable.scaling = [0.35, 0.35, 0.35];
+        myObjects.coffeeTable.translation = [4.0, 0.0 ,1.0];
+        myObjects.coffeeTable.texture = myTextures.ctable;
+        
+        myObjects.tvStand.scaling = [0.25, 0.50, 0.25];
+        myObjects.tvStand.translation = [-8.0, 0.0 ,1.0];
+        myObjects.tvStand.texture = myTextures.tvStand;
+        
+        myObjects.tv.translation = [-8.75, 2.35 , 1.35];
+        myObjects.tv.scaling = [1.0, 1.0, 1.30];
+        myObjects.tv.texture = myTextures.computer2;
+        
+        myObjects.cup.scaling = [0.0075, 0.0075, 0.0075];
+        myObjects.cup.translation = [-7, 3.0, -5.0];
+        myObjects.cup.texture = myTextures.cup;
+
+        myObjects.chest.scaling = [0.7, 0.75, 0.75];
+        myObjects.chest.translation = [8.5, 2.0, 9.0];
+        myObjects.chest.texture = myTextures.chest;
+
+        myObjects.pillow.scaling = [0.75, 0.75, 0.75];
+        myObjects.pillow.translation = [8.5, 4.3, -8.0];
+        myObjects.pillow.rotateX = -Math.PI/2;
+        myObjects.pillow.animationDirection = -1;
+        myObjects.pillow.texture = myTextures.cloth;
+        myObjects.pillow.animate = function() {
+            if (this.translation[0] < 7.5) {
+                this.doAnimation = false;
+                this.animationDirection *=-1;
+                this.translation[0] = 7.5;
+            }
+            else if(this.translation[0] > 8.5) {
+                this.doAnimation = false;
+                this.animationDirection *=-1;
+                this.translation[0] = 8.5;
+            }
+            else {
+                this.translation[0] += 0.01 * this.animationDirection;
+            }
+        };
+
+        myObjects.shade_pic.scaling = [0.5, 1.0, 0.9];
+        myObjects.shade_pic.translation = [9.87, 5.0, 0.0];
+        myObjects.shade_pic.rotateX = -Math.PI/2;
+        myObjects.shade_pic.rotateY = -Math.PI/2;
+        myObjects.shade_pic.animationDirection = 1;        
+        myObjects.shade_pic.texture = myTextures.shade;
+        myObjects.shade_pic.animate = function () {
+            if (this.translation[2] < 0.0) {
+                this.doAnimation = false;
+                this.animationDirection *=-1;
+                this.translation[2] = 0.0;
+            } else if (this.translation[2] > 1.0) {
+                this.doAnimation = false;
+                this.animationDirection *=-1;
+                this.translation[2] = 1.0;
+            } else {
+                this.translation[2] += 0.01 * this.animationDirection;
+            }
+        };
+
+        myObjects.vent.scaling = [0.5, 1.0, 1.0];
+        myObjects.vent.translation = [-9.3, 0.05, 8.8];
+        myObjects.vent.texture = myTextures.vent;
+
+        myObjects.door.scaling = [1.8, 8.0, 0.15];
+        myObjects.door.translation = [0.0, 0.0, 9.9];
+        myObjects.door.texture = myTextures.door;
+        myObjects.door.preTranslation = [-1.8, 0.0, 0.0];
+        myObjects.door.postRotation = {'angle': -0.01, 'axis': [0.0, 1.0, 0.0]};
+        myObjects.door.rotationDirection = -1;
+        myObjects.door.animate = function() {
+            if (this.postRotation.angle < -1.57) {
+                this.doAnimation = false;
+                this.rotationDirection *=-1;
+                this.postRotation.angle = -1.57
+            }
+            else if(this.postRotation.angle > 0.0) {
+                this.doAnimation = false;
+                this.rotationDirection *=-1;
+                this.postRotation.angle = 0.0;
+            }
+            else {
+                this.postRotation.angle += 0.01 * this.rotationDirection;
+            }
+        };
+
+        myObjects.door_frame.scaling = [2.0, 1.0, 4.2];
+        myObjects.door_frame.translation = [-1.8, 4.1, 9.89];
+        myObjects.door_frame.rotateX = -Math.PI/2;
+        myObjects.door_frame.rotateY = Math.PI;
+        myObjects.door_frame.texture = myTextures.door_frame;
+
+        myObjects.floor.scaling = [10.0, 1.0, 10.0];
+        myObjects.floor.translation = [0.0, 0.0, 0.0];
+        myObjects.floor.shininess = 30;
+        myObjects.floor.texture = myTextures.floor;
+
+        myObjects.ceiling.scaling = [10.0, 1.0, 10.0];
+        myObjects.ceiling.translation = [0.0, 10.0, 0.0];
+        myObjects.ceiling.texture = myTextures.ceiling;
+
+        myObjects.leftWall.scaling = [10.0, 1.0, 10.0];
+        myObjects.leftWall.translation = [-10.0, 0.0, 0.0];
+        myObjects.leftWall.rotateZ = Math.PI/2;
+        myObjects.leftWall.shininess = 1;
+        myObjects.leftWall.texture = myTextures.wall;
+
+        myObjects.rightWall.scaling = [10.0, 1.0, 10.0];
+        myObjects.rightWall.translation = [10.0, 0.0, 0.0];
+        myObjects.rightWall.rotateZ = -Math.PI/2;
+        myObjects.rightWall.texture = myTextures.wall;
+
+        myObjects.frontWall.scaling = [10.0, 1.0, 10.0];
+        myObjects.frontWall.translation = [0.0, 0.0, -10.0];
+        myObjects.frontWall.rotateX = -Math.PI/2;
+        myObjects.frontWall.texture = myTextures.wall;
+
+        myObjects.backWall.scaling = [10.0, 1.0, 10.0];
+        myObjects.backWall.translation = [0.0, 0.0, 10.0];
+        myObjects.backWall.rotateX = Math.PI/2;
+        myObjects.backWall.texture = myTextures.wall;
+
+        // Don't draw templates
+        myObjects.square.visible = false;
+        myObjects.cube.visible = false;
+        myObjects.drawer.visible = false;
+    }
+
+    function resetParticle(p) {
+        p.pos = [];
+        p.pos[0] = particleData.originX;
+        p.pos[1] = particleData.originY;
+        p.pos[2] = particleData.originZ;
+
+        p.vel = [   Math.random() - 0.5,
+                    Math.random(),
+                    Math.random() - 0.5 ];
+
+        p.lifespan = (Math.random() * particleData.particleLifespan);
+        p.remainingLife = p.lifespan;
+    }
+
+    function initParticles(count) {
+        var i, p;
+
+        particleData.particleArray = new Float32Array(count * 4);
+
+        for(i = 0; i < count; ++i) {
+            p = {};
+            resetParticle(p);
+            particleData.particles.push(p);
+
+            particleData.particleArray[(i*4)] = p.pos[0];
+            particleData.particleArray[(i*4) + 1] = p.pos[1];
+            particleData.particleArray[(i*4) + 2] = p.pos[2];
+            particleData.particleArray[(i*4) + 3] = p.remainingLife / p.lifespan;;
+        }
+
+        particleData.particleBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, particleData.particleBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, particleData.particleArray, gl.STATIC_DRAW);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    }
+
+    function updateParticles(elapsed) {
+        var i, p, count = particleData.particles.length;
+
+        for(i = 0; i < count; ++i) {
+            p = particleData.particles[i];
+
+            p.remainingLife -= elapsed;
+            if(p.remainingLife <= 0) {
+                resetParticle(p);
+            }
+
+            p.pos[0] += p.vel[0] * elapsed;
+            p.pos[1] += p.vel[1] * elapsed;
+            p.pos[2] += p.vel[2] * elapsed;
+
+            particleData.particleArray[(i*4)] = p.pos[0];
+            particleData.particleArray[(i*4) + 1] = p.pos[1];
+            particleData.particleArray[(i*4) + 2] = p.pos[2];
+            particleData.particleArray[(i*4) + 3] = p.remainingLife / p.lifespan;
+        }
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, particleData.particleBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, particleData.particleArray, gl.STATIC_DRAW);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    }
+
+    function initOffScreenBuffer() {
+        offScreen.FrameBuffer = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, offScreen.FrameBuffer);
+        offScreen.FrameBuffer.width = 1024;
+        offScreen.FrameBuffer.height = 512;
+
+        offScreen.Texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, offScreen.Texture)
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_NEAREST);
+        gl.generateMipmap(gl.TEXTURE_2D);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, offScreen.FrameBuffer.width, offScreen.FrameBuffer.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+        offScreen.RenderBuffer = gl.createRenderbuffer();
+        gl.bindRenderbuffer(gl.RENDERBUFFER, offScreen.RenderBuffer);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, offScreen.FrameBuffer.width, offScreen.FrameBuffer.height);
+
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, offScreen.Texture, 0);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, offScreen.RenderBuffer);
+
+        gl.bindTexture(gl.TEXTURE_2D, null);
+        gl.bindRenderbuffer(gl.REBDERBUFFER, null);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
+
+    cameraTrans = {};
+    cameraTrans.translation = [0.0, 0.0, 0.0];
+    cameraTrans.rotateX = 0;
+    cameraTrans.rotateY = 0;
+    cameraTrans.rotateZ = 0;
+    var fogIntensity = 0.0;
+
+    function drawScene(renderPicker) {
+        gl.viewport(0, 0, gl.viewportWidth, gl.viewportHeight);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+        mat4.perspective(45, gl.viewportWidth / gl.viewportHeight, 0.1, 100.0, pMatrix);
+        mat4.identity(mvMatrix);
+
+        //Camera control
+        mat4.rotateX(mvMatrix, cameraTrans.rotateX);
+        mat4.rotateY(mvMatrix, cameraTrans.rotateY);
+        mat4.rotateZ(mvMatrix, cameraTrans.rotateZ);
+        mat4.translate(mvMatrix, cameraTrans.translation);
+            // Move it up to eye position
+        mat4.translate(mvMatrix, [0.0, -5.0, 0.0]);
+        mvPushMatrix();
+
+        //Keep the light in the same position
+        var lightingLocation = [0.0, 9.0, 0.0];
+        mat4.multiplyVec3(mvMatrix, lightingLocation, lightingLocation);
+
+        // Most of the uniforms and buffers can stay the same
+        gl.useProgram(shaderPrograms.phongLighting);
+        gl.uniform1i(shaderPrograms.phongLighting.pickerRenderUniform, renderPicker);
+        gl.uniform3f(shaderPrograms.phongLighting.ambientColorUniform, 1.0, 1.0, 1.0);
+        gl.uniform3f(shaderPrograms.phongLighting.pointLightingLocationUniform, lightingLocation[0], lightingLocation[1], lightingLocation[2]);
+        gl.uniform3f(shaderPrograms.phongLighting.pointLightingSpecularColorUniform, 0.3, 0.3, 0.3);
+        gl.uniform3f(shaderPrograms.phongLighting.pointLightingDiffuseColorUniform, 0.3, 0.3, 0.3);
+        gl.uniform1i(shaderPrograms.phongLighting.samplerUniform, 0);
+        gl.uniform1f(shaderPrograms.phongLighting.materialShininessUniform, 100);
+        gl.uniform1f(shaderPrograms.phongLighting.fogIntensityUniform, fogIntensity);
+
+        $.each(myObjects, function(key, obj) {
+            if (obj.visible) {
+                mvPopMatrix();
+                mvPushMatrix();
+
+                gl.uniform4f(shaderPrograms.phongLighting.objectColorUniform, obj.pickerColor[0], obj.pickerColor[1], obj.pickerColor[2], 1.0);
+
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, obj.texture);
+
+                gl.bindBuffer(gl.ARRAY_BUFFER, obj.VertexPositionBuffer);
+                gl.vertexAttribPointer(shaderPrograms.phongLighting.vertexPositionAttribute, obj.VertexPositionBuffer.itemSize, gl.FLOAT, false, 0, 0);
+
+                gl.bindBuffer(gl.ARRAY_BUFFER, obj.TextureCoordBuffer);
+                gl.vertexAttribPointer(shaderPrograms.phongLighting.textureCoordAttribute, obj.TextureCoordBuffer.itemSize, gl.FLOAT, false, 0, 0);
+
+                gl.bindBuffer(gl.ARRAY_BUFFER, obj.VertexNormalBuffer);
+                gl.vertexAttribPointer(shaderPrograms.phongLighting.vertexNormalAttribute, obj.VertexNormalBuffer.itemSize, gl.FLOAT, false, 0, 0);
+
+                gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, obj.VertexIndexBuffer);
+
+                if(obj.doAnimation === true)
+                    obj.animate();
+
+                // apply all the object specific transoformations
+                mat4.translate(mvMatrix, obj.translation);
+                if (obj.shininess)
+                    gl.uniform1f(shaderPrograms.phongLighting.materialShininessUniform, obj.shininess);
+                if (obj.postRotation)
+                    mat4.rotate(mvMatrix, obj.postRotation.angle, obj.postRotation.axis);
+                if (obj.preTranslation)
+                    mat4.translate(mvMatrix, obj.preTranslation);
+                if (obj.rotateZ)
+                    mat4.rotateZ(mvMatrix, obj.rotateZ);
+                if (obj.rotateY)
+                    mat4.rotateY(mvMatrix, obj.rotateY);
+                if (obj.rotateX)
+                    mat4.rotateX(mvMatrix, obj.rotateX);
+                mat4.scale(mvMatrix, obj.scaling);
+
+                setMatrixUniforms(shaderPrograms.phongLighting);
+                gl.drawElements(gl.TRIANGLES, obj.VertexIndexBuffer.numItems, gl.UNSIGNED_SHORT, 0);
+            }
+        });
+
+        // Render the particles
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_COLOR, gl.SRC_ALPHA);
+        gl.useProgram(shaderPrograms.particles);
+
+        mvPopMatrix();
+        setMatrixUniforms(shaderPrograms.particles);
+
+        gl.uniform1f(shaderPrograms.particles.pointSizeUniform, particleData.particleSize);
+        gl.uniform3f(shaderPrograms.particles.colorUniform, particleData.color[0], particleData.color[1], particleData.color[1]);
+        gl.uniform1f(shaderPrograms.particles.fogIntensityUniform, fogIntensity);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, particleData.particleBuffer);
+        gl.vertexAttribPointer(shaderPrograms.particles.particleLocationAttribute, 4, gl.FLOAT, false, 0, 0);
+
+        gl.drawArrays(gl.POINTS, 0, particleData.particles.length);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        gl.disable(gl.BLEND);
+    }
+
+    var lastTime = 0;
+    var timer = 180;
+    var dead = false;
+    var winning = false;
+
+    function animate() {
+        var timerText = $('#timer-text')[0];
+        var timeNow = new Date().getTime();
+        if (lastTime != 0) {
+            var elapsed = timeNow - lastTime;
+            updateParticles(elapsed/ 1000.0);
+        }
+        
+        //timer
+        if (timer > 0) {
+            timer -= 1/60;
+            timerText.innerHTML = "Time to escape : " + timer.toString() + " seconds";
+        } if (timer <= 0) {
+            timer = 0
+            timerText.innerHTML = "Time to escape : " + timer.toString() + " seconds";
+            dead = true;
+        }
+
+        //dying effect
+        if (dead) {
+            if (cameraTrans.rotateZ <= Math.PI/2) {
+                cameraTrans.rotateZ += elapsed * 0.02 * (Math.PI/180);
+                if ( cameraTrans.translation[1] >= 0.0) {
+                    cameraTrans.translation[1] += elapsed * 0.001; 
+                }
+            }
+        }
+        
+        //winning the game
+        if (winning){
+            timer += 1/60;
+            fogIntensity = 0;
+            fogIntensity -= 0.00002;
+        }
+
+
+        lastTime = timeNow;
+
+        //Increase the fog intensity for how long we've been in the room
+        fogIntensity += 0.00002;
+
+        //Check the pressed keys to move forward, back, left, and right
+        if (!dead) {
+            $.each( cameraControls.pressedKeys, function(key, value) {
+                if (value) {
+                    switch (key) {
+                        case "87":
+                            // the w key
+                            cameraTrans.translation[2] += Math.cos(cameraTrans.rotateY) * cameraControls.moveFactor;
+                            cameraTrans.translation[0] -= Math.sin(cameraTrans.rotateY) * cameraControls.moveFactor;
+                            break;
+                        case "65":
+                            // the a key
+                            cameraTrans.translation[0] += Math.cos(cameraTrans.rotateY) * cameraControls.moveFactor;
+                            cameraTrans.translation[2] += Math.sin(cameraTrans.rotateY) * cameraControls.moveFactor;
+                            break;
+                        case "83":
+                            // the s key
+                            cameraTrans.translation[2] -= Math.cos(cameraTrans.rotateY) * cameraControls.moveFactor;
+                            cameraTrans.translation[0] += Math.sin(cameraTrans.rotateY) * cameraControls.moveFactor;
+                            break;
+                        case "68":
+                            // the d key
+                            cameraTrans.translation[0] -= Math.cos(cameraTrans.rotateY) * cameraControls.moveFactor;
+                            cameraTrans.translation[2] -= Math.sin(cameraTrans.rotateY) * cameraControls.moveFactor;
+                            break;
+                    }
+                }
+            });
+        }
+
+        //Keep the user from leaving the room space
+        if (cameraTrans.translation[0] > 9.5) {
+            cameraTrans.translation[0] = 9.5;
+        }
+        if (cameraTrans.translation[0] < -9.5) {
+            cameraTrans.translation[0] = -9.5;
+        }
+        if (cameraTrans.translation[2] > 9.5) {
+            cameraTrans.translation[2] = 9.5;
+        }
+        if (cameraTrans.translation[2] < -9.5) {
+            cameraTrans.translation[2] = -9.5;
+        }
+
+        //Limit the camera rotation to be like that of a human
+        //head, between 90deg and -90deg
+        if (cameraTrans.rotateX > Math.PI/2) {
+            cameraTrans.rotateX = Math.PI/2;
+        }
+        else if (cameraTrans.rotateX < -Math.PI/2) {
+            cameraTrans.rotateX = -Math.PI/2;
+        }
+
+        //Allow the user to continue looking right, left, up, and down
+        //when they reach the edge of the screen.
+        if (cameraControls.currentX < 30) {
+            cameraTrans.rotateY -= 0.01;
+        }
+        if (cameraControls.currentX > 995) {
+            cameraTrans.rotateY += 0.01;
+        }
+        if (cameraControls.currentY < 30) {
+            cameraTrans.rotateX -= 0.01;
+        }
+        if (cameraControls.currentY > 495) {
+            cameraTrans.rotateX += 0.01;
+        }
+    }
+
+
+    function tick() {
+        requestAnimFrame(tick);
+        drawScene(false);
+        animate();
+    }
+
+    var cameraControls = {};
+    cameraControls.pressedKeys = {};
+    cameraControls.moveFactor = 0.1;
+    cameraControls.currentX = 500;
+    cameraControls.currentY = 250;
+    cameraControls.holdLeft = false;
+    cameraControls.holdRight = false;
+
+    function handleKeyDown (evt) {
+        cameraControls.pressedKeys[evt.keyCode] = true;
+    }
+
+    function handleKeyUp (evt) {
+        cameraControls.pressedKeys[evt.keyCode] = false;
+    }
+
+    function handleMouseMove (evt) {
+        cameraTrans.rotateX -= (cameraControls.currentY - evt.clientY) * 0.005;
+        cameraTrans.rotateY -= (cameraControls.currentX - evt.clientX) * 0.005;
+
+        cameraControls.currentX = evt.clientX;
+        cameraControls.currentY = evt.clientY;
+    }
+
+    function handleMouseOver (evt) {
+        cameraControls.currentX = evt.clientX;
+        cameraControls.currentY = evt.clientY;
+    }
+
+    function handleMouseOut (evt) {
+        //Set these to default so that the scene
+        //doesn't keep moving when the mouse exits
+        cameraControls.currentX = 500;
+        cameraControls.currentY = 250;
+    }
+
+    function clickItem(itemName) {
+        var eventText = $('#evt-text')[0];
+        var playerItems = $('#player-items')[0];
+        var selectedItem = playerItems[playerItems.selectedIndex].value;
+
+        if (!dead) {
+            switch(itemName) {
+                case 'door':
+                    if (selectedItem == 'bluekey') {
+                        eventText.innerHTML = "You open the door! You're free! You win!";
+                        myObjects.door.doAnimation = true;
+                        winning = true;
+                    }
+                    else {
+                        eventText.innerHTML = "The door is locked.";
+                    }
+                    break;
+                case 'key':
+                    eventText.innerHTML = "You find a golden key!";
+                    playerItems.add(new Option('Golden Key', 'key'));
+                    myObjects.key.visible = false;
+                    break;
+                case 'pillow':
+                    eventText.innerHTML = "You move the pillow.";
+                    myObjects.pillow.doAnimation = true;
+                    break;
+                case 'vent':
+                    eventText.innerHTML = "The vent is emitting a dangerous looking gas.";
+                    break;
+                case 'shade_pic':
+                    if (selectedItem === 'glass') {
+                        eventText.innerHTML = "you use a piece of glass to cut off the picture, and take the picture down"
+                        myObjects.shade_pic.visible = false;
+                        playerItems.add(new Option('Shade Picture', 'shade_pic'));
+                        break;
+                    }
+                    eventText.innerHTML = "moving shade's picture";
+                    myObjects.shade_pic.doAnimation = true;
+                    myObjects.frame.doAnimation = true;
+                    myObjects.bluekey.doAnimation = true;
+                    break;
+                case 'tendollar':
+                    eventText.innerHTML = "You found ten dolloars bill, lucky day! but first need to get out here";
+                    playerItems.add(new Option('Ten Dollar Bill', 'tendollar'));
+                    myObjects.tendollar.visible = false;
+                    break;
+                case 'bluekey':
+                    if (selectedItem === 'hammer') {
+                        eventText.innerHTML = "You found a blue key!";
+                        playerItems.add(new Option('Blue Key', 'bluekey'));
+                        myObjects.bluekey.visible = false;
+                    } else {
+                        eventText.innerHTML = "You try to use your two to take the key out of the wall," + 
+                                                "but you did not success, you may need some tools";
+                    }
+                    break;
+                case 'chest':
+                    if (selectedItem === 'key') {
+                        eventText.innerHTML = "You open it, and got a hammer!";
+                        playerItems.add(new Option('Hammer', 'hammer'));
+                    }
+                    else {
+                        eventText.innerHTML = "The drawer is locked.";
+                    }
+                    break;
+                case 'cup':
+                    if (selectedItem === 'hammer') {
+                        eventText.innerHTML = "You use the hummer to hit the cup, then you got a piece of glass (Watch out, it may cut you finger!)";
+                        playerItems.add(new Option('A piece of glass', 'glass'));
+                        myObjects.cup.visible = false;
+                    }
+                    else {
+                        eventText.innerHTML = "A cup, nothing more";
+                    }
+                    break;
+                case 'bed':
+                    eventText.innerHTML = "A bed, it gives me an unusal feeling, I semll something in the air!";
+                    break
+                default:
+                    if (timer >= 120) {
+                        eventText.innerHTML = "Nothing interesting happened.";
+                    } else if (timer < 120 && timer >= 60) {
+                        eventText.innerHTML = "There are something in the air, it is better to get out here quick!.";
+                    } else if (timer <60 && timer >= 30) {
+                        eventText.innerHTML = "You are feeling sick, You start holding your breath!";
+                    } else if (timer <30 && timer >= 15) {
+                        eventText.innerHTML = "You cannot see things clealy now, quickly, find the way out of this room!.";
+                    } else if (timer <15 && timer > 0) {
+                        eventText.innerHTML = "You cannot hold your breath much longer, you start breathing the air. Death is coming for you!.";
+                    } else {
+                        timer = 0;
+                    }
+            }
+        }
+        if (timer === 0) {
+            eventText.innerHTML = "Time runs out, You are dead!";
+            alert("you lost the game");
+        }
+        
+    }
+
+    function handleMouseClick (evt) {
+        //Render the scene for picking
+        gl.bindFramebuffer(gl.FRAMEBUFFER, offScreen.FrameBuffer);
+        gl.bindTexture(gl.TEXTURE_2D, offScreen.Texture)
+        gl.bindRenderbuffer(gl.RENDERBUFFER, offScreen.RenderBuffer);
+        drawScene(true);
+
+        // Use the client's x and y to pull a texture color
+        // off of the rendered texture
+        var canvas = $('#project-canvas')[0];
+
+        var finalX = evt.clientX - canvas.offsetLeft;
+        var finalY = canvas.height - (evt.clientY - canvas.offsetTop);
+
+        var pickedColor = new Uint8Array(1 * 1 * 4);
+
+        gl.readPixels(finalX, finalY, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pickedColor);
+
+        //Reset things to get back to normal
+        gl.bindTexture(gl.TEXTURE_2D, null);
+        gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+        console.log(pickedColor);
+        //Use the color to activate the appropriate effect
+        clickItem(myPickerHash[String(pickedColor[0])+String(pickedColor[1])+String(pickedColor[2])]);
+    }
+
+    function webGLStart() {
+        var canvas = document.getElementById("project-canvas");
+        initGL(canvas);
+        canvas.onmousemove = handleMouseMove;
+        canvas.onmouseover = handleMouseOver;
+        canvas.onmouseout = handleMouseOut;
+        canvas.onmousedown = handleMouseClick;
+
+        document.onkeydown = handleKeyDown;
+        document.onkeyup = handleKeyUp;
+
+        initShaders();
+        initTextures();
+        initObjects();
+        initOffScreenBuffer();
+        initParticles(1024);
+
+        gl.clearColor(0.0, 0.0, 0.0, 1.0);
+        gl.enable(gl.DEPTH_TEST);
+
+        tick();
+    }
+
+    $(document).ready( function() {
+        downloadMeshes({'table': 'objects/table_quad.obj',
+                        'bed': 'objects/bed.obj',
+                        'door': 'objects/door.obj',
+                        'square': 'objects/square.obj',
+                        'cube': 'objects/cube.obj',
+                        'key': 'objects/key.obj',
+                        'pillow': 'objects/pillow_2.obj',
+                        'drawer': 'objects/drawer.obj',
+                        'tendollar': 'objects/tendollar.obj',
+                        'bluekey': 'objects/bluekey.obj',
+                        'cup': 'objects/cup.obj',
+                        'chest': 'objects/chest.obj',
+                        'toyplane': 'objects/toyplane.obj',
+                        'sofa': 'objects/sofa.obj',
+                        'coffeeTable': 'objects/coffeeTable.obj',
+                        'tvStand': 'objects/coffeeTable.obj',
+                        'tv': 'objects/computer.obj'
+                        },
+            function(downloadedObjects) {
+                myMeshes = downloadedObjects;
+                webGLStart();
+            });
+    });
+
+</script>
+
+
+</head>
+
+
+<body style="overflow-x:hidden; overflow-y:hidden">
+
+    <canvas id="project-canvas" style="border: none;" width="1024" height="512"></canvas>
+    <div id="evt-text" style="position: absolute; left: 100px; top: 525px;">Where am I? I feel dizzy... That must have been some night...</div>\
+    <br/>
+    <div id="timer-text" style="position: absolute; left: 100px; top: 550px;"></div>
+    <div style="position: absolute; left: 1050px; top: 10px;">
+        Current Item
+        <select id="player-items" style="width:200px;">
+            <option value=""></option>
+        </select>
+    </div>
+
+</body>
+
+</html>
